@@ -40,7 +40,7 @@ public class IntentUtils {
         FileInputStream inputFile = null;
         try {
             inputFile = new FileInputStream(path);
-            mime = URLConnection.guessContentTypeFromStream(inputFile); // fails sometimes
+            mime = URLConnection.guessContentTypeFromStream(inputFile);// fails sometime
         } catch (Exception e) {
             e.printStackTrace();
         } finally {
@@ -67,10 +67,10 @@ public class IntentUtils {
         PackageManager manager = context.getPackageManager();
         List<ResolveInfo> infos = manager.queryIntentActivities(intent, 0);
         if (infos.size() > 0) {
-            // There is at least 1 app that can handle this intent
+            //Then there is an Application(s) can handle this intent
             return true;
         } else {
-            // No app can handle this intent
+            //No Application can handle this intent
             return false;
         }
     }

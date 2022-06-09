@@ -38,11 +38,9 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-//import java.net.HttpURLConnection;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLDecoder;
-import java.security.cert.X509Certificate;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -56,17 +54,14 @@ import java.util.regex.Pattern;
 import androidx.work.Worker;
 import androidx.work.WorkerParameters;
 
-import javax.net.ssl.HostnameVerifier;
-import javax.net.ssl.HttpsURLConnection;
-import javax.net.ssl.SSLContext;
-import javax.net.ssl.TrustManager;
-import javax.net.ssl.X509TrustManager;
-
 import io.flutter.FlutterInjector;
 import io.flutter.embedding.engine.FlutterEngine;
 import io.flutter.embedding.engine.dart.DartExecutor;
+import io.flutter.embedding.engine.loader.FlutterLoader;
+import io.flutter.embedding.engine.plugins.shim.ShimPluginRegistry;
 import io.flutter.plugin.common.MethodCall;
 import io.flutter.plugin.common.MethodChannel;
+import io.flutter.plugin.common.PluginRegistry;
 import io.flutter.view.FlutterCallbackInformation;
 
 public class DownloadWorker extends Worker implements MethodChannel.MethodCallHandler {
@@ -79,16 +74,15 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
     public static final String ARG_OPEN_FILE_FROM_NOTIFICATION = "open_file_from_notification";
     public static final String ARG_CALLBACK_HANDLE = "callback_handle";
     public static final String ARG_DEBUG = "debug";
-    public static final String ARG_STEP = "step";
     public static final String ARG_SAVE_IN_PUBLIC_STORAGE = "save_in_public_storage";
-    public static final String ARG_IGNORESSL = "ignoreSsl";
 
     private static final String TAG = DownloadWorker.class.getSimpleName();
     private static final int BUFFER_SIZE = 4096;
     private static final String CHANNEL_ID = "FLUTTER_DOWNLOADER_NOTIFICATION";
+    private static final int STEP_UPDATE = 5;
 
     private static final AtomicBoolean isolateStarted = new AtomicBoolean(false);
-    private static final ArrayDeque<List<Object>> isolateQueue = new ArrayDeque<>();
+    private static final ArrayDeque<List> isolateQueue = new ArrayDeque<>();
     private static FlutterEngine backgroundFlutterEngine;
 
     private final Pattern charsetPattern = Pattern.compile("(?i)\\bcharset=\\s*\"?([^\\s;\"]*)");
@@ -101,18 +95,22 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
     private boolean showNotification;
     private boolean clickToOpenDownloadedFile;
     private boolean debug;
-    private boolean ignoreSsl;
     private int lastProgress = 0;
     private int primaryId;
     private String msgStarted, msgInProgress, msgCanceled, msgFailed, msgPaused, msgComplete;
     private long lastCallUpdateNotification = 0;
-    private int step;
     private boolean saveInPublicStorage;
 
-    public DownloadWorker(@NonNull final Context context, @NonNull WorkerParameters params) {
+    public DownloadWorker(@NonNull final Context context,
+                          @NonNull WorkerParameters params) {
         super(context, params);
 
-        new Handler(context.getMainLooper()).post(() -> startBackgroundIsolate(context));
+        new Handler(context.getMainLooper()).post(new Runnable() {
+            @Override
+            public void run() {
+                startBackgroundIsolate(context);
+            }
+        });
     }
 
     private void startBackgroundIsolate(Context context) {
@@ -121,29 +119,36 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
                 SharedPreferences pref = context.getSharedPreferences(FlutterDownloaderPlugin.SHARED_PREFERENCES_KEY, Context.MODE_PRIVATE);
                 long callbackHandle = pref.getLong(FlutterDownloaderPlugin.CALLBACK_DISPATCHER_HANDLE_KEY, 0);
 
-                backgroundFlutterEngine = new FlutterEngine(getApplicationContext(), null, false);
+                String appBundlePath =  FlutterInjector.instance().flutterLoader().findAppBundlePath();;
+                AssetManager assets = context.getAssets();
 
                 // We need to create an instance of `FlutterEngine` before looking up the
                 // callback. If we don't, the callback cache won't be initialized and the
                 // lookup will fail.
                 FlutterCallbackInformation flutterCallback =
                         FlutterCallbackInformation.lookupCallbackInformation(callbackHandle);
-                if (flutterCallback == null) {
-                    log("Fatal: failed to find callback");
-                    return;
-                }
 
-                final String appBundlePath = FlutterInjector.instance().flutterLoader().findAppBundlePath();
-                final AssetManager assets = getApplicationContext().getAssets();
-                backgroundFlutterEngine.getDartExecutor().executeDartCallback(new DartExecutor.DartCallback(assets, appBundlePath, flutterCallback));
+                backgroundFlutterEngine = new FlutterEngine(context);
+
+                DartExecutor executor = backgroundFlutterEngine.getDartExecutor();
+                DartExecutor.DartCallback dartCallback = new DartExecutor.DartCallback(assets, appBundlePath, flutterCallback);
+                executor.executeDartCallback(dartCallback);
+
+                /// backward compatibility with V1 embedding
+                if (getApplicationContext() instanceof PluginRegistry.PluginRegistrantCallback) {
+                    PluginRegistry.PluginRegistrantCallback pluginRegistrantCallback = (PluginRegistry.PluginRegistrantCallback) getApplicationContext();
+                    pluginRegistrantCallback.registerWith(new ShimPluginRegistry(backgroundFlutterEngine));
+                }
             }
         }
-        backgroundChannel = new MethodChannel(backgroundFlutterEngine.getDartExecutor(), "vn.hunghd/downloader_background");
+
+        DartExecutor executor = backgroundFlutterEngine.getDartExecutor();
+        backgroundChannel = new MethodChannel(executor, "vn.hunghd/downloader_background");
         backgroundChannel.setMethodCallHandler(this);
     }
 
     @Override
-    public void onMethodCall(MethodCall call, @NonNull MethodChannel.Result result) {
+    public void onMethodCall(MethodCall call, MethodChannel.Result result) {
         if (call.method.equals("didInitializeDispatcher")) {
             synchronized (isolateStarted) {
                 while (!isolateQueue.isEmpty()) {
@@ -167,7 +172,7 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
         String filename = getInputData().getString(ARG_FILE_NAME);
 
         DownloadTask task = taskDao.loadTask(getId().toString());
-        if (task != null && task.status == DownloadStatus.ENQUEUED) {
+        if (task.status == DownloadStatus.ENQUEUED) {
             updateNotification(context, filename == null ? url : filename, DownloadStatus.CANCELED, -1, null, true);
             taskDao.updateTask(getId().toString(), DownloadStatus.CANCELED, lastProgress);
         }
@@ -186,8 +191,6 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
         String headers = getInputData().getString(ARG_HEADERS);
         boolean isResume = getInputData().getBoolean(ARG_IS_RESUME, false);
         debug = getInputData().getBoolean(ARG_DEBUG, false);
-        step = getInputData().getInt(ARG_STEP, 10);
-        ignoreSsl = getInputData().getBoolean(ARG_IGNORESSL, false);
 
         Resources res = getApplicationContext().getResources();
         msgStarted = res.getString(R.string.flutter_downloader_notification_started);
@@ -265,7 +268,6 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
         conn.setRequestProperty("Accept-Encoding", "identity");
         conn.setRequestProperty("Range", "bytes=" + downloadedBytes + "-");
         conn.setDoInput(true);
-
         return downloadedBytes;
     }
 
@@ -297,21 +299,9 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
                     throw new IOException("Stuck in redirect loop");
 
                 resourceUrl = new URL(url);
-
-                if(ignoreSsl) {
-                    trustAllHosts();
-                    if (resourceUrl.getProtocol().toLowerCase().equals("https")) {
-                        HttpsURLConnection https = (HttpsURLConnection)resourceUrl.openConnection();
-                        https.setHostnameVerifier(DO_NOT_VERIFY);
-                        httpConn = https;
-                    } else {
-                        httpConn = (HttpURLConnection)resourceUrl.openConnection();
-                    }
-                } else {
-                    httpConn = (HttpsURLConnection) resourceUrl.openConnection();
-                }
-
                 log("Open connection to " + url);
+                httpConn = (HttpURLConnection) resourceUrl.openConnection();
+
                 httpConn.setConnectTimeout(60000);
                 httpConn.setReadTimeout(60000);
                 httpConn.setInstanceFollowRedirects(false);   // Make the logic below easier to detect redirections
@@ -345,9 +335,9 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
             }
 
             httpConn.connect();
-            String contentType;
+
             if ((responseCode == HttpURLConnection.HTTP_OK || (isResume && responseCode == HttpURLConnection.HTTP_PARTIAL)) && !isStopped()) {
-                contentType = httpConn.getContentType();
+                String contentType = httpConn.getContentType();
                 long contentLength = android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N ? httpConn.getContentLengthLong() : httpConn.getContentLength();
                 log("Content-Type = " + contentType);
                 log("Content-Length = " + contentLength);
@@ -392,15 +382,15 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
                 } else {
                     // 2. new download, create new file
                     // there are two case according to Android SDK version and save path
-                    // From Android 11 onwards, file is only downloaded to app-specific directory (internal storage)
-                    // or public shared download directory (external storage).
-                    // The second option will ignore `savedDir` parameter.
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && saveInPublicStorage) {
-                        Uri uri = createFileInPublicDownloadsDir(filename, contentType);
+                        // in Android 11, file is only downloaded to app-specific directory (internal storage)
+                        // or public shared download directory (external storage).
+                        // The second option will ignore `savedDir` parameter.
+                        Uri uri = createDownloadFileInScopedStorageModel(filename);
                         savedFilePath = getMediaStoreEntryPathApi29(uri);
                         outputStream = context.getContentResolver().openOutputStream(uri, "w");
                     } else {
-                        File file = createFileInAppSpecificDir(filename, savedDir);
+                        File file = createDownloadFileWithDirectFilePath(filename, savedDir);
                         savedFilePath = file.getPath();
                         outputStream = new FileOutputStream(file, false);
                     }
@@ -415,7 +405,7 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
                     int progress = (int) ((count * 100) / (contentLength + downloadedBytes));
                     outputStream.write(buffer, 0, bytesRead);
 
-                    if ((lastProgress == 0 || progress > (lastProgress + step) || progress == 100)
+                    if ((lastProgress == 0 || progress > lastProgress + STEP_UPDATE || progress == 100)
                             && progress != lastProgress) {
                         lastProgress = progress;
 
@@ -442,7 +432,7 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
                     }
 
                     if (clickToOpenDownloadedFile) {
-                        if (android.os.Build.VERSION.SDK_INT < Build.VERSION_CODES.Q && storage != PackageManager.PERMISSION_GRANTED)
+                        if(android.os.Build.VERSION.SDK_INT < Build.VERSION_CODES.Q && storage != PackageManager.PERMISSION_GRANTED)
                             return;
                         Intent intent = IntentUtils.validatedFileIntent(getApplicationContext(), savedFilePath, contentType);
                         if (intent != null) {
@@ -494,11 +484,11 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
     /**
      * Create a file using java.io API
      */
-    private File createFileInAppSpecificDir(String filename, String savedDir) {
+    private File createDownloadFileWithDirectFilePath(String filename, String savedDir) {
         File newFile = new File(savedDir, filename);
         try {
             boolean rs = newFile.createNewFile();
-            if (rs) {
+            if(rs) {
                 return newFile;
             } else {
                 logError("It looks like you are trying to save file in public storage but not setting 'saveInPublicStorage' to 'true'");
@@ -514,18 +504,16 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
      * Create a file inside the Download folder using MediaStore API
      */
     @RequiresApi(Build.VERSION_CODES.Q)
-    private Uri createFileInPublicDownloadsDir(String filename, String mimeType) {
-        Uri collection = MediaStore.Downloads.EXTERNAL_CONTENT_URI;
-        ContentValues values = new ContentValues();
-        values.put(MediaStore.Downloads.DISPLAY_NAME, filename);
-        values.put(MediaStore.Downloads.MIME_TYPE, mimeType);
-        values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
-        ContentResolver contentResolver = getApplicationContext().getContentResolver();
+    private Uri createDownloadFileInScopedStorageModel(String filename) {
+        Uri collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY);
         try {
+            ContentValues values = new ContentValues();
+            values.put(MediaStore.Downloads.DISPLAY_NAME, filename);
+            ContentResolver contentResolver = getApplicationContext().getContentResolver();
             return contentResolver.insert(collection, values);
         } catch (Exception e) {
             e.printStackTrace();
-            logError("Create a file using MediaStore API failed.");
+            logError("Create a file using MediaStore API failed ");
         }
         return null;
     }
@@ -555,10 +543,10 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
 
     void scanFilePath(String path, String mimeType, CallbackUri callback) {
         MediaScannerConnection.scanFile(
-                getApplicationContext(),
-                new String[]{path},
-                new String[]{mimeType},
-                (path1, uri) -> callback.invoke(uri));
+            getApplicationContext(),
+            new String[]{path},
+            new String[]{mimeType},
+            (path1, uri) -> callback.invoke(uri));
     }
 
     private void cleanUp() {
@@ -593,7 +581,10 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
         if (!showNotification) return;
         // Make a channel if necessary
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            // Create the NotificationChannel
+            // Create the NotificationChannel, but only on API 26+ because
+            // the NotificationChannel class is new and not in the support library
+
+
             Resources res = getApplicationContext().getResources();
             String channelName = res.getString(R.string.flutter_downloader_notification_channel_name);
             String channelDescription = res.getString(R.string.flutter_downloader_notification_channel_description);
@@ -808,38 +799,5 @@ public class DownloadWorker extends Worker implements MethodChannel.MethodCallHa
 
     public interface CallbackUri {
         void invoke(Uri uri);
-    }
-
-    final static HostnameVerifier DO_NOT_VERIFY = (hostname, session) -> true;
-
-    /**
-     * Trust every server - dont check for any certificate
-     */
-    private static void trustAllHosts() {
-        final String TAG = "trustAllHosts";
-        // Create a trust manager that does not validate certificate chains
-        TrustManager[] trustManagers = new TrustManager[] { new X509TrustManager() {
-
-            public java.security.cert.X509Certificate[] getAcceptedIssuers() {
-                return new java.security.cert.X509Certificate[] {};
-            }
-
-            public void checkClientTrusted(X509Certificate[] chain, String authType) {
-                Log.i(TAG, "checkClientTrusted");
-            }
-
-            public void checkServerTrusted(X509Certificate[] chain, String authType) {
-                Log.i(TAG, "checkServerTrusted");
-            }
-        } };
-
-        // Install the all-trusting trust manager
-        try {
-            SSLContext sslContent = SSLContext.getInstance("TLS");
-            sslContent.init(null, trustManagers, new java.security.SecureRandom());
-            HttpsURLConnection.setDefaultSSLSocketFactory(sslContent.getSocketFactory());
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
     }
 }
